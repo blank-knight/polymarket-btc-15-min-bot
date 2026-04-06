@@ -1,0 +1,33 @@
+{
+  "nodes": [
+    {"id": "price", "type": "group", "x": 0, "y": 0, "width": 400, "height": 250, "label": "价格数据引擎", "subitems": [
+      {"id": "binance_ws", "type": "leaf", "x": 20, "y": 30, "width": 170, "height": 40, "label": "binance_ws.py\nWebSocket实时价格"},
+      {"id": "binance_rest", "type": "leaf", "x": 210, "y": 30, "width": 170, "height": 40, "label": "binance_rest.py\nREST多时间框架K线"},
+      {"id": "price_manager", "type": "leaf", "x": 20, "y": 90, "width": 170, "height": 40, "label": "price_manager.py\n技术指标计算"},
+      {"id": "price_recorder", "type": "leaf", "x": 210, "y": 90, "width": 170, "height": 40, "label": "price_recorder.py\n价格快照记录"}
+    ]},
+    {"id": "market", "type": "group", "x": 450, "y": 0, "width": 400, "height": 250, "label": "市场发现引擎", "subitems": [
+      {"id": "gamma_client", "type": "leaf", "x": 470, "y": 30, "width": 170, "height": 40, "label": "gamma_client.py\n市场slug+token"},
+      {"id": "ptb_fetcher", "type": "leaf", "x": 660, "y": 30, "width": 170, "height": 40, "label": "price_beat_fetcher.py\nPlaywright抓PTB"}
+    ]},
+    {"id": "signal", "type": "group", "x": 0, "y": 300, "width": 400, "height": 250, "label": "信号引擎", "subitems": [
+      {"id": "signal_engine", "type": "leaf", "x": 20, "y": 330, "width": 170, "height": 40, "label": "signal_engine.py\n三层信号融合"},
+      {"id": "sniper", "type": "leaf", "x": 210, "y": 330, "width": 170, "height": 40, "label": "last_minute_sniper.py\n60s狙击"},
+      {"id": "optimizer", "type": "leaf", "x": 115, "y": 390, "width": 170, "height": 40, "label": "strategy_optimizer.py\n自适应参数"}
+    ]},
+    {"id": "decision", "type": "group", "x": 450, "y": 300, "width": 400, "height": 250, "label": "决策+执行+风控", "subitems": [
+      {"id": "kelly", "type": "leaf", "x": 470, "y": 330, "width": 120, "height": 40, "label": "kelly_sizer.py\nKelly仓位"},
+      {"id": "trader", "type": "leaf", "x": 610, "y": 330, "width": 120, "height": 40, "label": "trader.py\n交易执行"},
+      {"id": "risk", "type": "leaf", "x": 540, "y": 390, "width": 170, "height": 40, "label": "risk_manager.py\n风控检查"}
+    ]}
+  ],
+  "edges": [
+    {"from": "price_manager", "to": "signal_engine", "label": "趋势/RSI/布林"},
+    {"from": "gamma_client", "to": "signal_engine", "label": "UP/DOWN价格"},
+    {"from": "ptb_fetcher", "to": "signal_engine", "label": "PTB"},
+    {"from": "signal_engine", "to": "kelly", "label": "Edge+方向"},
+    {"from": "kelly", "to": "risk", "label": "仓位大小"},
+    {"from": "risk", "to": "trader", "label": "通过/拒绝"},
+    {"from": "optimizer", "to": "signal_engine", "label": "参数调整"}
+  ]
+}

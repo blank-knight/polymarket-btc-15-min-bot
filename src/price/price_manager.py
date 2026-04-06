@@ -5,11 +5,13 @@
 """
 
 import asyncio
+import aiohttp
 from datetime import datetime
 from dataclasses import dataclass
 
 from src.price.binance_ws import BinancePriceStream
 from src.price.binance_rest import fetch_klines
+from src.config.settings import BINANCE_REST_URL, BINANCE_SYMBOL
 from src.utils.logger import setup_logger
 
 logger = setup_logger("price_manager")
@@ -54,24 +56,70 @@ class PriceManager:
         self.indicators = TechnicalIndicators()
         self._kline_cache: dict[str, list] = {}  # interval → klines
         self._update_task = None
+        self._ws_mode = False  # True=WS, False=REST轮询
 
     async def start(self):
         """启动价格流"""
         connected = await self.ws.connect()
-        if not connected:
-            logger.error("Binance WS 连接失败")
-            return False
+        if connected:
+            self._ws_mode = True
+            await self._refresh_klines()
+            self._update_task = asyncio.create_task(self._background_update())
+            logger.info("价格管理器已启动 (WebSocket模式)")
+            return True
+        else:
+            # REST fallback
+            self._ws_mode = False
+            logger.warning("WebSocket 连接失败，切换到 REST 轮询模式")
+            await self._refresh_klines()
+            # 用 REST 获取初始价格
+            await self._rest_price_update()
+            self._update_task = asyncio.create_task(self._rest_poll_loop())
+            logger.info("价格管理器已启动 (REST轮询模式)")
+            return True
 
-        # 初始加载 K 线
-        await self._refresh_klines()
+    async def _rest_price_update(self):
+        """通过 REST API 获取最新价格"""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    data = await resp.json()
+                    self.ws.current_price = float(data["price"])
+        except Exception as e:
+            logger.debug(f"REST 价格获取失败: {e}")
 
-        # 启动后台任务
-        self._update_task = asyncio.create_task(self._background_update())
-        logger.info("价格管理器已启动")
-        return True
+    async def _rest_poll_loop(self):
+        """REST 模式下每 5 秒轮询价格，每 60 秒刷新 K 线"""
+        import aiohttp
+        counter = 0
+        while True:
+            try:
+                await asyncio.sleep(5)
+                counter += 1
+
+                # 每 5 秒获取价格
+                async with aiohttp.ClientSession() as session:
+                    url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        data = await resp.json()
+                        self.ws.current_price = float(data["price"])
+
+                # 每 60 秒刷新 K 线
+                if counter % 12 == 0:
+                    await self._refresh_klines()
+
+                self._update_indicators()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"REST 轮询异常: {e}")
+                await asyncio.sleep(5)
 
     async def _background_update(self):
-        """后台定期刷新 K 线数据"""
+        """后台定期刷新 K 线数据 (WebSocket模式)"""
         while self.ws.running:
             try:
                 # 同时监听 WS

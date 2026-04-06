@@ -169,8 +169,8 @@ def get_open_trades() -> list[dict]:
 def insert_signal(market_slug: str, strategy: str, direction: str, **kwargs) -> int:
     conn = get_connection()
     c = conn.cursor()
-    cols = ["market_slug", "strategy", "direction"] + list(kwargs.keys())
-    vals = [market_slug, strategy, direction] + list(kwargs.values())
+    cols = ["timestamp", "market_slug", "strategy", "direction"] + list(kwargs.keys())
+    vals = [datetime.utcnow().isoformat(), market_slug, strategy, direction] + list(kwargs.values())
     placeholders = ", ".join(["?"] * len(cols))
     c.execute(f"INSERT INTO signals ({', '.join(cols)}) VALUES ({placeholders})", vals)
     conn.commit()

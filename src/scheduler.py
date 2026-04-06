@@ -56,6 +56,7 @@ class TradingLoop:
         self.current_slug = None
         self.current_market = None
         self.current_ptb = None
+        self._traded_slugs: set[str] = set()  # 已交易过的市场，防止重复下单
 
     async def start(self):
         """启动交易循环"""
@@ -86,6 +87,13 @@ class TradingLoop:
         # 启动主循环
         await self._main_loop()
 
+    def _last_slug(self) -> str | None:
+        """获取上一个市场的 slug"""
+        if self.current_slug:
+            ts = int(self.current_slug.split("-")[-1])
+            return f"btc-updown-15m-{ts - 900}"
+        return None
+
     async def _main_loop(self):
         """主事件循环"""
         while self.running:
@@ -98,6 +106,9 @@ class TradingLoop:
 
                 # 检查是否需要初始化新市场
                 if slug != self.current_slug:
+                    # 先结算上一个市场
+                    if self.current_slug:
+                        await self._on_market_settle()
                     await self._on_new_market(slug, start_ts, end_ts)
 
                 # 计算当前时间在 15 分钟窗口中的位置
@@ -108,18 +119,22 @@ class TradingLoop:
                 if 0 < remaining <= 60:
                     await self._last_minute_snipe()
 
-                # 市场结束: 结算
-                if remaining <= 0:
-                    await self._on_market_settle()
-                    # 等到下一个 15 分钟窗口
-                    await asyncio.sleep(5)
-                    continue
-
                 # 中期: 策略分析 (在第 5-10 分钟)
                 if 300 <= elapsed <= 600 and self.current_market:
                     await self._evaluate_strategy()
 
+                # 实时显示 BTC 价格
+                btc = self.price_manager.ws.current_price if self.price_manager.ws else 0
+                if btc > 0:
+                    ptb_str = f" | PTB=${self.current_ptb:,.2f}" if self.current_ptb else ""
+                    remain_str = f" | 剩余{remaining:.0f}s" if remaining > 0 else ""
+                    logger.info(f"💰 BTC=${btc:,.2f}{ptb_str}{remain_str}")
+
                 # 每 10 秒检查一次
+                await asyncio.sleep(10)
+
+            except Exception as e:
+                logger.error(f"主循环异常: {e}")
                 await asyncio.sleep(10)
 
             except Exception as e:
@@ -162,6 +177,10 @@ class TradingLoop:
     async def _evaluate_strategy(self):
         """策略分析"""
         if not self.current_market:
+            return
+
+        # 检查当前市场是否已下过单（防止重复）
+        if self.current_slug in self._traded_slugs:
             return
 
         ind = self.price_manager.get_indicators()
@@ -232,8 +251,15 @@ class TradingLoop:
             f"置信度={signal.confidence:.1%} Edge={signal.edge:+.1%}"
         )
 
+        # 标记已交易
+        self._traded_slugs.add(self.current_slug)
+
     async def _last_minute_snipe(self):
         """最后 60 秒狙击"""
+        # 已经交易过则跳过
+        if self.current_slug in self._traded_slugs:
+            return
+
         if not self.current_market or not self.current_ptb:
             return
 
@@ -257,22 +283,54 @@ class TradingLoop:
 
         if result and result.should_snipe:
             logger.info(f"  🎯 狙击执行: {result.direction.upper()} Edge={result.edge:+.1%}")
+            self._traded_slugs.add(self.current_slug)
 
     async def _on_market_settle(self):
         """市场结算"""
         if not self.current_market or not self.current_ptb:
+            self.current_slug = None
+            self.current_market = None
+            self.current_ptb = None
             return
 
         btc = self.price_manager.ws.current_price
         if btc <= 0:
+            self.current_slug = None
+            self.current_market = None
+            self.current_ptb = None
             return
 
         # 判断结果
         result = "up" if btc >= self.current_ptb else "down"
         logger.info(f"  ⚖️ 结算: {result.upper()} (BTC=${btc:,.2f} vs PTB=${self.current_ptb:,.2f})")
 
+        # 更新市场结果
+        from src.utils.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE markets SET result=?, settled_at=datetime('now') WHERE slug=?", (result, self.current_slug))
+        conn.commit()
+        conn.close()
+
         # 结算交易
         settle_trades(self.current_slug, result)
+
+        # 记录 PnL 汇总
+        summary = get_summary()
+        from src.utils.db import get_connection as gc
+        conn2 = gc()
+        conn2.execute(
+            "INSERT INTO pnl_log (total_pnl, bankroll, trade_count, win_count, loss_count) VALUES (?, ?, ?, ?, ?)",
+            (summary["total_pnl"], self.risk_mgr.bankroll + summary["total_pnl"],
+             summary["total_trades"], summary["wins"], summary["losses"])
+        )
+        conn2.commit()
+        conn2.close()
+
+        logger.info(
+            f"  📊 累计: {summary['total_trades']}笔交易 | "
+            f"胜率{summary['win_rate']:.0%} | "
+            f"总PnL ${summary['total_pnl']:+.2f}"
+        )
 
         # 重置
         self.current_slug = None
