@@ -15,6 +15,7 @@ from src.execution.trader import execute_trade
 from src.risk.risk_manager import RiskManager
 from src.utils.db import insert_signal
 from src.utils.logger import setup_logger
+from src.market.orderbook import get_real_buy_price
 
 logger = setup_logger("sniper")
 
@@ -29,7 +30,7 @@ class SnipeResult:
     reason: str = ""
 
 
-def evaluate_snipe(
+async def evaluate_snipe(
     btc_current: float,
     price_to_beat: float,
     up_price: float,
@@ -40,23 +41,7 @@ def evaluate_snipe(
     risk_mgr: RiskManager,
     bankroll: float,
 ) -> SnipeResult | None:
-    """
-    评估最后时刻狙击机会
-
-    Args:
-        btc_current: BTC 当前价格
-        price_to_beat: Price to Beat
-        up_price: UP token 价格
-        down_price: DOWN token 价格
-        up_token: UP token ID
-        down_token: DOWN token ID
-        market_slug: 市场 slug
-        risk_mgr: 风控管理器
-        bankroll: 当前资金
-
-    Returns:
-        SnipeResult or None
-    """
+    """评估最后时刻狙击机会"""
     if btc_current <= 0 or price_to_beat <= 0:
         return None
 
@@ -78,7 +63,6 @@ def evaluate_snipe(
     # 检查 Polymarket 价格是否滞后
     if direction == "up":
         pm_price = up_price
-        # BTC 涨了，UP 应该接近 1.0，如果还低于阈值就有机会
         if up_price >= 0.60:
             return SnipeResult(
                 direction="up",
@@ -88,8 +72,8 @@ def evaluate_snipe(
                 should_snipe=False,
                 reason=f"UP 价格已充分反映 ({up_price:.2f})",
             )
-        edge = (0.60 + abs(change) * 5) - up_price  # 估计真实概率
-        edge = min(edge, 0.30)  # 上限 30%
+        edge = (0.60 + abs(change) * 5) - up_price
+        edge = min(edge, 0.30)
     else:
         pm_price = down_price
         if down_price >= 0.60:
@@ -114,6 +98,28 @@ def evaluate_snipe(
             reason=f"Edge 不足 ({edge:+.1%})",
         )
 
+    # 🆕 获取真实 orderbook 买入价（考虑滑点）— 同步调用
+    target_token = up_token if direction == "up" else down_token
+    real_price = get_real_buy_price(target_token, budget_usd=5.0)
+
+    if real_price and real_price > 0:
+        logger.info(
+            f"📊 真实价格: {real_price:.3f} (Gamma中间价={pm_price:.3f}) "
+            f"滑点={real_price - pm_price:.3f}"
+        )
+
+        if real_price >= 0.95:
+            return SnipeResult(
+                direction=direction,
+                edge=edge,
+                btc_change=change,
+                pm_price=pm_price,
+                should_snipe=False,
+                reason=f"真实价格太高 ({real_price:.3f})，利润空间不足",
+            )
+
+        pm_price = real_price
+
     # 记录信号
     insert_signal(
         market_slug=market_slug,
@@ -125,15 +131,13 @@ def evaluate_snipe(
     )
 
     # 计算仓位 (保守: 标准 Kelly 的一半)
-    from src.config.settings import KELLY_FRACTION
-    # 狙击用更保守的仓位
     confidence = 0.60 + edge * 0.5
 
     position = calculate_position(
         direction=direction,
         confidence=min(confidence, 0.75),
-        up_price=up_price,
-        down_price=down_price,
+        up_price=real_price if (real_price and direction == "up") else up_price,
+        down_price=real_price if (real_price and direction == "down") else down_price,
         up_token=up_token,
         down_token=down_token,
         bankroll=bankroll,

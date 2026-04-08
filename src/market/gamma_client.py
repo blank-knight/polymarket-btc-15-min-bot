@@ -5,6 +5,7 @@ Polymarket Gamma API — BTC 15 分钟市场发现
 """
 
 import asyncio
+import json
 import aiohttp
 import math
 from datetime import datetime, timezone
@@ -163,18 +164,42 @@ async def get_market_by_slug(slug: str) -> BTC15mMarket | None:
                     return None
 
                 m = data[0]
-                tokens = m.get("tokens", [])
                 up_token = down_token = ""
                 up_price = down_price = 0.5
 
-                for token in tokens:
-                    outcome = token.get("outcome", "").lower()
-                    if outcome == "up":
-                        up_token = token.get("token_id", "")
-                        up_price = float(token.get("price", 0.5))
-                    elif outcome == "down":
-                        down_token = token.get("token_id", "")
-                        down_price = float(token.get("price", 0.5))
+                # 尝试从 clobTokenIds 解析
+                clob_ids_raw = m.get("clobTokenIds", "[]")
+                try:
+                    clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+                except:
+                    clob_ids = []
+
+                # 尝试从 tokens 解析（旧 API 格式）
+                tokens = m.get("tokens", [])
+                
+                if clob_ids and len(clob_ids) >= 2:
+                    # 新格式：clobTokenIds 是 [up_id, down_id]
+                    up_token = clob_ids[0]
+                    down_token = clob_ids[1]
+                elif tokens:
+                    for token in tokens:
+                        outcome = token.get("outcome", "").lower()
+                        if outcome == "up":
+                            up_token = token.get("token_id", "")
+                            up_price = float(token.get("price", 0.5))
+                        elif outcome == "down":
+                            down_token = token.get("token_id", "")
+                            down_price = float(token.get("price", 0.5))
+
+                # 解析价格
+                prices_raw = m.get("outcomePrices", "[]")
+                try:
+                    prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                    if prices and len(prices) >= 2:
+                        up_price = float(prices[0])
+                        down_price = float(prices[1])
+                except:
+                    pass
 
                 parts = slug.split("-")
                 ts = int(parts[-1])

@@ -12,6 +12,10 @@ import asyncio
 import argparse
 import sys
 
+# 加载 .env
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.config.settings import TRADING_MODE, INITIAL_BANKROLL
 from src.utils.db import init_db
 from src.utils.logger import setup_logger

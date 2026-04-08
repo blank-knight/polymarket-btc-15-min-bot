@@ -24,6 +24,8 @@ POLYMARKET_URL = "https://polymarket.com"
 
 # === 钱包配置 (实盘用) ===
 POLYGON_PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
+POLYMARKET_FUNDER = os.getenv("POLYMARKET_FUNDER", "")
+CLOB_SIGNATURE_TYPE = int(os.getenv("CLOB_SIGNATURE_TYPE", "2"))
 POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 API_KEY = os.getenv("CLOB_API_KEY", "")
 API_SECRET = os.getenv("CLOB_API_SECRET", "")

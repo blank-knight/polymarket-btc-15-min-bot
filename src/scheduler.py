@@ -40,6 +40,10 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("scheduler")
 
+# 秒开策略阈值：BTC 与 PTB 偏移超过此值则开盘秒下
+INSTANT_TRADE_MIN_GAP_PCT = 0.0005  # 0.05% ≈ $34 at $68K
+INSTANT_TRADE_MAX_WAIT_SECONDS = 60  # 最多等 60 秒（等 PTB 获取）
+
 
 class TradingLoop:
     """15 分钟轮转交易主循环"""
@@ -57,6 +61,9 @@ class TradingLoop:
         self.current_market = None
         self.current_ptb = None
         self._traded_slugs: set[str] = set()  # 已交易过的市场，防止重复下单
+        
+        # 持仓跟踪（止盈卖出用）
+        self._open_position = None  # {"side": "up", "token_id": "...", "shares": 4.0, "buy_price": 0.50, "cost_usd": 2.0}
 
     async def start(self):
         """启动交易循环"""
@@ -115,7 +122,11 @@ class TradingLoop:
                 elapsed = (now - start_time).total_seconds()
                 remaining = (end_time - now).total_seconds()
 
-                # 结算前 60 秒: 最后狙击
+                # 🆕 秒开策略：市场刚开始（前 60 秒），拿到 PTB 就秒下
+                if 0 < elapsed <= INSTANT_TRADE_MAX_WAIT_SECONDS and self.current_slug not in self._traded_slugs:
+                    await self._instant_open_trade()
+
+                # 结算前 60 秒: 最后狙击（仅当秒开未触发时）
                 if 0 < remaining <= 60:
                     await self._last_minute_snipe()
 
@@ -129,6 +140,10 @@ class TradingLoop:
                     ptb_str = f" | PTB=${self.current_ptb:,.2f}" if self.current_ptb else ""
                     remain_str = f" | 剩余{remaining:.0f}s" if remaining > 0 else ""
                     logger.info(f"💰 BTC=${btc:,.2f}{ptb_str}{remain_str}")
+
+                # 🆕 止盈检查：持仓价格涨到目标就卖出
+                if self._open_position and self.current_market and btc > 0 and self.current_ptb:
+                    await self._check_take_profit(btc)
 
                 # 每 10 秒检查一次
                 await asyncio.sleep(10)
@@ -254,6 +269,164 @@ class TradingLoop:
         # 标记已交易
         self._traded_slugs.add(self.current_slug)
 
+    async def _instant_open_trade(self):
+        """秒开策略：开盘拿到 PTB 就根据方向下单"""
+        if not self.current_market or not self.current_ptb:
+            return
+
+        btc = self.price_manager.ws.current_price if self.price_manager.ws else 0
+        if btc <= 0:
+            return
+
+        change = (btc - self.current_ptb) / self.current_ptb
+
+        # 偏移太小不交易（BTC 和 PTB 太接近 = 50/50 赌博）
+        if abs(change) < INSTANT_TRADE_MIN_GAP_PCT:
+            logger.info(
+                f"  ⏭️ 秒开跳过: BTC/PTB 差值太小 ({change:+.3%}) "
+                f"BTC=${btc:,.2f} PTB=${self.current_ptb:,.2f}"
+            )
+            return
+
+        direction = "up" if change > 0 else "down"
+
+        # 简单 edge 估算
+        if direction == "up":
+            pm_price = self.current_market.up_price
+            token = self.current_market.up_token_id
+        else:
+            pm_price = self.current_market.down_price
+            token = self.current_market.down_token_id
+
+        # 价格已经跑走则放弃
+        if pm_price >= 0.70:
+            logger.info(f"  ⏭️ 秒开跳过: {direction.upper()} 价格已高 ({pm_price:.2f})")
+            return
+
+        # === 流动性检查（挂限价单，只需确认 orderbook 存在）===
+        try:
+            from src.execution.trader import _get_clob_client
+            clob = _get_clob_client()
+            if clob:
+                ob = clob.get_order_book(token)
+                bids = ob.bids if hasattr(ob, 'bids') else []
+                asks = ob.asks if hasattr(ob, 'asks') else []
+                # 有 orderbook 数据就行（我们是挂限价单，不需要吃单深度）
+                if not bids and not asks:
+                    logger.info(f"  ⏭️ 秒开跳过: {direction.upper()} orderbook 为空")
+                    return
+                logger.info(f"  📊 流动性 ✅ bids={len(bids)} asks={len(asks)} levels")
+        except Exception as e:
+            logger.warning(f"  ⚠️ 流动性检查跳过: {e}")
+
+        edge = abs(change) * 5 + (0.50 - pm_price) * 0.5
+        edge = max(edge, 0)
+        edge = min(edge, 0.30)
+
+        logger.info(f"  📐 edge={edge:.3f} (change={change:+.3%}, pm={pm_price:.2f})")
+
+        if edge < MIN_EDGE:
+            logger.info(f"  ⏭️ 秒开跳过: Edge 不足 ({edge:.3f} < {MIN_EDGE})")
+            return
+
+        # 记录信号
+        from src.utils.db import insert_signal
+        insert_signal(
+            market_slug=self.current_slug,
+            strategy="instant_open",
+            direction=direction,
+            confidence=0.55 + edge * 0.3,
+            edge=edge,
+            filtered=0,
+        )
+
+        # 固定投入（$2/次，保守）
+        cost_usd = min(2.0, self.risk_mgr.bankroll * 0.2)
+        shares = cost_usd / pm_price
+
+        logger.info(
+            f"  ⚡ 秒开! {direction.upper()} BTC=${btc:,.2f} PTB=${self.current_ptb:,.2f} "
+            f"差={change:+.2%} @ ${pm_price:.2f} 投入=${cost_usd:.2f}"
+        )
+
+        result = execute_trade(
+            market_slug=self.current_slug,
+            side=direction,
+            token_id=token,
+            shares=shares,
+            price=pm_price,
+            cost_usd=cost_usd,
+            edge=edge,
+        )
+
+        # 记录持仓（用于止盈卖出）
+        if result.get("status") in ("live", "simulated"):
+            self._open_position = {
+                "side": direction,
+                "token_id": token,
+                "shares": result.get("shares", shares),
+                "buy_price": result.get("price", pm_price),
+                "cost_usd": result.get("cost", cost_usd),
+                "market_slug": self.current_slug,
+            }
+            logger.info(
+                f"  📦 持仓记录: {direction.upper()} {self._open_position['shares']:.1f}股 "
+                f"@ ${self._open_position['buy_price']:.2f}"
+            )
+
+        self._traded_slugs.add(self.current_slug)
+
+    async def _check_take_profit(self, btc: float):
+        """止盈检查：持仓价格上涨就卖出锁定利润"""
+        pos = self._open_position
+        if not pos:
+            return
+
+        # 获取当前 Polymarket 价格
+        if pos["side"] == "up":
+            current_pm = self.current_market.up_price
+        else:
+            current_pm = self.current_market.down_price
+
+        buy_price = pos["buy_price"]
+
+        # 止盈条件：价格涨了 30%+（比如 0.50 → 0.65+）
+        # 或者价格涨了 0.15+（比如 0.50 → 0.65）
+        profit_pct = (current_pm - buy_price) / buy_price if buy_price > 0 else 0
+
+        # 条件1：盈利超过 30%
+        take_profit = profit_pct >= 0.30
+        # 条件2：价格绝对值超过 0.75（已经很确定赢了）
+        take_profit = take_profit or current_pm >= 0.75
+        # 条件3：盈利超过 20% 且剩余时间 < 3 分钟（快结算了，锁定利润）
+        remaining_check = False
+        elapsed_check = False
+        # 用简单方式判断
+        take_profit = take_profit or (profit_pct >= 0.20 and current_pm >= 0.65)
+
+        if not take_profit:
+            return
+
+        # 卖出！
+        from src.execution.trader import sell_position
+        sell_result = sell_position(
+            market_slug=pos["market_slug"],
+            token_id=pos["token_id"],
+            shares=pos["shares"],
+            sell_price=current_pm,
+        )
+
+        if sell_result.get("status") in ("live_sell", "simulated_sell"):
+            revenue = sell_result.get("revenue", pos["shares"] * current_pm)
+            profit = revenue - pos["cost_usd"]
+            logger.info(
+                f"  🎉 止盈卖出! {pos['side'].upper()} {pos['shares']:.1f}股 "
+                f"买=${buy_price:.2f} → 卖=${current_pm:.2f} "
+                f"利润=${profit:.2f} ({profit_pct:+.0%})"
+            )
+            # 清除持仓
+            self._open_position = None
+
     async def _last_minute_snipe(self):
         """最后 60 秒狙击"""
         # 已经交易过则跳过
@@ -269,7 +442,7 @@ class TradingLoop:
         if btc <= 0:
             return
 
-        result = evaluate_snipe(
+        result = await evaluate_snipe(
             btc_current=btc,
             price_to_beat=self.current_ptb,
             up_price=self.current_market.up_price,
@@ -336,6 +509,7 @@ class TradingLoop:
         self.current_slug = None
         self.current_market = None
         self.current_ptb = None
+        self._open_position = None  # 清空持仓
 
     async def stop(self):
         self.running = False

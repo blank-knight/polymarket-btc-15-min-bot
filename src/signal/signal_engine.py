@@ -180,10 +180,11 @@ def generate_signal(
         signal.should_trade = False
         return signal
 
-    if not signal.safety_keylevel_ok:
-        signal.safety_skip_reason = "接近关键价位"
-        signal.should_trade = False
-        return signal
+    # 实盘模式放宽：不检查关键价位（布林带/整数位过滤太严）
+    # if not signal.safety_keylevel_ok:
+    #     signal.safety_skip_reason = "接近关键价位"
+    #     signal.should_trade = False
+    #     return signal
 
     # Edge 过滤
     if abs(signal.edge) < 0.03:  # MIN_EDGE
