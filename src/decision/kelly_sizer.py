@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from src.config.settings import (
     KELLY_FRACTION,
     MAX_POSITION_RATIO,
-    MIN_EDGE,
+    MIN_EDGE_BASE,
     MIN_TRADE_USD,
     INITIAL_BANKROLL,
 )

@@ -83,7 +83,8 @@ class PriceManager:
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                url = f"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+                from src.config.settings import BINANCE_REST_URL
+                url = f"{BINANCE_REST_URL}/ticker/price?symbol=BTCUSDT"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     data = await resp.json()
                     self.ws.current_price = float(data["price"])
@@ -101,7 +102,8 @@ class PriceManager:
 
                 # 每 5 秒获取价格
                 async with aiohttp.ClientSession() as session:
-                    url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+                    from src.config.settings import BINANCE_REST_URL
+                    url = f"{BINANCE_REST_URL}/ticker/price?symbol=BTCUSDT"
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                         data = await resp.json()
                         self.ws.current_price = float(data["price"])

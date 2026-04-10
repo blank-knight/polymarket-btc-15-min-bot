@@ -12,8 +12,8 @@ DATA_DIR.mkdir(exist_ok=True)
 TRADING_MODE = os.getenv("TRADING_MODE", "SIMULATION")  # SIMULATION | LIVE
 
 # === Binance API ===
-BINANCE_WS_URL = "wss://stream.binance.com/ws"
-BINANCE_REST_URL = "https://api.binance.com/api/v3"
+BINANCE_WS_URL = "wss://stream.binance.us/ws"
+BINANCE_REST_URL = "https://api.binance.us/api/v3"
 BINANCE_SYMBOL = "btcusdt"
 
 # === Polymarket API ===
@@ -32,13 +32,34 @@ API_SECRET = os.getenv("CLOB_API_SECRET", "")
 API_PASSPHRASE = os.getenv("CLOB_API_PASSPHRASE", "")
 
 # === 资金管理 ===
-INITIAL_BANKROLL = float(os.getenv("INITIAL_BANKROLL", "100"))
+INITIAL_BANKROLL = float(os.getenv("INITIAL_BANKROLL", "52"))
 KELLY_FRACTION = 0.25           # Quarter-Kelly
 MAX_POSITION_RATIO = 0.05       # 单笔最大 5% bankroll
 MAX_DAILY_LOSS_RATIO = 0.10     # 单日最大亏损 10%
-MAX_DAILY_TRADES = 100          # 单日最大交易次数
-MIN_EDGE = 0.03                 # 最小 Edge 3%
+MAX_DAILY_TRADES = 200          # 单日最大交易次数（提高频率）
+MIN_EDGE_BASE = 0.025             # v0.7: 动态 edge 基准值 2.5%
+MIN_EDGE_MIN = 0.015             # 波动大时最低 1.5%
+MIN_EDGE_MAX = 0.045             # 波动小时最高 4.5%
+VOLATILITY_LOOKBACK = 20         # 用最近 20 根 5m K线算波动率
 MIN_TRADE_USD = 1.0             # 最小交易金额
+MAX_BUY_PRICE = 0.60            # v0.3: 最大买入价 0.60（放宽，允许中等赔率下单）
+SETTLE_FEE_RATE = 0.04          # v0.3: Polymarket 结算手续费估算 4%
+CONSECUTIVE_LOSS_PAUSE = 2       # v0.3: 连亏 2 次触发暂停
+COOLDOWN_AFTER_LOSS = 30        # v0.3: 暂停 30 分钟（从 60 降）
+
+# === v0.4: Taker/Maker 混合模式 ===
+STRONG_EDGE_THRESHOLD = 0.05    # 强信号门槛：>= 此值用 Taker 模式（立刻吃单）
+MAKER_PRICE_OFFSET = 0.01       # Maker 挂单比中间价低/高多少
+MAKER_ORDER_TIMEOUT = 60        # Maker 单未成交超时秒数（之后撤单）
+
+# === v0.4: 被动做市（Liquidity Rewards + Spread） ===
+PASSIVE_MM_ENABLED = False      # 已关闭：$55本金做市风险大于收益
+PASSIVE_MM_SPREAD = 0.08        # 挂单 spread：bid = mid - 0.04, ask = mid + 0.04
+PASSIVE_MM_SIZE_USD = 1.5       # 每边挂单金额（USD）
+
+# === v0.4: 止盈参数 ===
+TAKE_PROFIT_PRICE = 0.72        # 持仓涨到 0.72 触发止盈
+TAKE_PROFIT_PCT = 0.30          # 或者盈利 30% 触发止盈
 
 # === 策略参数 ===
 # 趋势分析
@@ -62,7 +83,7 @@ SNIPER_MIN_MOVE_PCT = 0.001         # BTC 至少偏移 0.1%
 SNIPER_PRICE_LAG_PCT = 0.03         # Polymarket 价格滞后 3%
 
 # 连续亏损保护
-CONSECUTIVE_LOSS_LIMIT = 5          # 连亏 5 次
+CONSECUTIVE_LOSS_LIMIT = 3          # 连亏 3 次全局暂停（安全底线）
 COOLDOWN_MINUTES = 60               # 暂停 60 分钟
 
 # === 数据库 ===

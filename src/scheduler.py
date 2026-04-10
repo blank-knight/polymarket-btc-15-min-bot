@@ -1,5 +1,5 @@
 """
-主循环 + 15 分钟轮转调度
+主循环 + 5 分钟轮转调度
 
 核心流程:
 1. 启动 Binance WS 价格流
@@ -30,23 +30,23 @@ from src.market.price_beat_fetcher import PriceBeatFetcher
 from src.signal.signal_engine import generate_signal, SignalStrength
 from src.decision.kelly_sizer import calculate_position
 from src.risk.risk_manager import RiskManager
-from src.execution.trader import execute_trade, settle_trades, get_summary
+from src.execution.trader import execute_trade, settle_trades, get_summary, place_passive_orders, cancel_all_orders
 from src.price.price_recorder import PriceRecorder
 from src.signal.last_minute_sniper import evaluate_snipe
 from src.signal.strategy_optimizer import StrategyOptimizer
-from src.config.settings import INITIAL_BANKROLL, MIN_EDGE
+from src.config.settings import INITIAL_BANKROLL, MIN_EDGE_BASE, MIN_EDGE_MIN, MIN_EDGE_MAX, VOLATILITY_LOOKBACK, STRONG_EDGE_THRESHOLD, MAKER_PRICE_OFFSET, PASSIVE_MM_ENABLED, PASSIVE_MM_SPREAD, PASSIVE_MM_SIZE_USD, TAKE_PROFIT_PRICE, TAKE_PROFIT_PCT
 from src.utils.db import insert_market, get_market
 from src.utils.logger import setup_logger
 
 logger = setup_logger("scheduler")
 
 # 秒开策略阈值：BTC 与 PTB 偏移超过此值则开盘秒下
-INSTANT_TRADE_MIN_GAP_PCT = 0.0005  # 0.05% ≈ $34 at $68K
+INSTANT_TRADE_MIN_GAP_PCT = 0.0002  # 0.02% ≈ $14 at $71K（从0.05%降低）
 INSTANT_TRADE_MAX_WAIT_SECONDS = 60  # 最多等 60 秒（等 PTB 获取）
 
 
 class TradingLoop:
-    """15 分钟轮转交易主循环"""
+    """5 分钟轮转交易主循环"""
 
     def __init__(self):
         self.price_manager = PriceManager()
@@ -64,6 +64,11 @@ class TradingLoop:
         
         # 持仓跟踪（止盈卖出用）
         self._open_position = None  # {"side": "up", "token_id": "...", "shares": 4.0, "buy_price": 0.50, "cost_usd": 2.0}
+        self._pause_until = 0  # v0.3: 连亏暂停时间戳
+        
+        # v0.4: 被动做市状态
+        self._mm_orders = []  # 当前被动做市挂单 [{"token_id", "order_id", ...}]
+        self._mm_market_slug = None  # 当前做市的市场 slug
 
     async def start(self):
         """启动交易循环"""
@@ -98,7 +103,7 @@ class TradingLoop:
         """获取上一个市场的 slug"""
         if self.current_slug:
             ts = int(self.current_slug.split("-")[-1])
-            return f"btc-updown-15m-{ts - 900}"
+            return f"btc-updown-5m-{ts - 300}"
         return None
 
     async def _main_loop(self):
@@ -118,21 +123,25 @@ class TradingLoop:
                         await self._on_market_settle()
                     await self._on_new_market(slug, start_ts, end_ts)
 
-                # 计算当前时间在 15 分钟窗口中的位置
+                # 计算当前时间在 5 分钟窗口中的位置
                 elapsed = (now - start_time).total_seconds()
                 remaining = (end_time - now).total_seconds()
 
-                # 🆕 秒开策略：市场刚开始（前 60 秒），拿到 PTB 就秒下
-                if 0 < elapsed <= INSTANT_TRADE_MAX_WAIT_SECONDS and self.current_slug not in self._traded_slugs:
-                    await self._instant_open_trade()
+                # 🆕 全程策略监控：趋势共振 + 动量 + 定价偏差 + PTB差值
+                # 不限制时间窗口，只要信号够强就下单
+                if self.current_slug not in self._traded_slugs:
+                    await self._instant_open_trade()   # PTB 差值快速检查
+                    if self.current_slug not in self._traded_slugs:
+                        await self._evaluate_strategy()  # 三层信号引擎
 
-                # 结算前 60 秒: 最后狙击（仅当秒开未触发时）
-                if 0 < remaining <= 60:
+                # v0.4: 被动做市 — 无信号交易时挂双面单赚 Liquidity Rewards
+                if PASSIVE_MM_ENABLED and not self._mm_orders and self.current_market:
+                    if self.current_slug not in self._traded_slugs:
+                        await self._place_passive_mm()
+
+                # 结算前 60 秒: 最后狙击（仅当未交易时）
+                if 0 < remaining <= 60 and self.current_slug not in self._traded_slugs:
                     await self._last_minute_snipe()
-
-                # 中期: 策略分析 (在第 5-10 分钟)
-                if 300 <= elapsed <= 600 and self.current_market:
-                    await self._evaluate_strategy()
 
                 # 实时显示 BTC 价格
                 btc = self.price_manager.ws.current_price if self.price_manager.ws else 0
@@ -141,8 +150,8 @@ class TradingLoop:
                     remain_str = f" | 剩余{remaining:.0f}s" if remaining > 0 else ""
                     logger.info(f"💰 BTC=${btc:,.2f}{ptb_str}{remain_str}")
 
-                # 🆕 止盈检查：持仓价格涨到目标就卖出
-                if self._open_position and self.current_market and btc > 0 and self.current_ptb:
+                # v0.4: 止盈检查 — 激活！
+                if self._open_position and self.current_market and btc > 0:
                     await self._check_take_profit(btc)
 
                 # 每 10 秒检查一次
@@ -158,6 +167,12 @@ class TradingLoop:
 
     async def _on_new_market(self, slug: str, start_ts: int, end_ts: int):
         """新市场开始"""
+        # v0.4: 先撤掉上一个市场的被动做市单
+        if self._mm_orders and self._mm_market_slug != slug:
+            for order in self._mm_orders:
+                cancel_all_orders(order.get("token_id"))
+            self._mm_orders = []
+
         self.current_slug = slug
         logger.info(f"\n{'─' * 60}")
         logger.info(f"📊 新市场: {slug}")
@@ -270,8 +285,16 @@ class TradingLoop:
         self._traded_slugs.add(self.current_slug)
 
     async def _instant_open_trade(self):
-        """秒开策略：开盘拿到 PTB 就根据方向下单"""
+        """差值狙击：全程监控 BTC vs PTB，差值够大就下单"""
         if not self.current_market or not self.current_ptb:
+            return
+
+        # v0.3: 连亏暂停检查
+        import time as _t
+        if _t.time() < self._pause_until:
+            remaining = int((self._pause_until - _t.time()) / 60)
+            if _t.time() % 300 < 10:  # 每5分钟打印一次
+                logger.info(f"  ⏸️ 连亏暂停中，还需等待 {remaining} 分钟")
             return
 
         btc = self.price_manager.ws.current_price if self.price_manager.ws else 0
@@ -282,11 +305,7 @@ class TradingLoop:
 
         # 偏移太小不交易（BTC 和 PTB 太接近 = 50/50 赌博）
         if abs(change) < INSTANT_TRADE_MIN_GAP_PCT:
-            logger.info(
-                f"  ⏭️ 秒开跳过: BTC/PTB 差值太小 ({change:+.3%}) "
-                f"BTC=${btc:,.2f} PTB=${self.current_ptb:,.2f}"
-            )
-            return
+            return  # 差值太小，静默跳过
 
         direction = "up" if change > 0 else "down"
 
@@ -298,9 +317,10 @@ class TradingLoop:
             pm_price = self.current_market.down_price
             token = self.current_market.down_token_id
 
-        # 价格已经跑走则放弃
-        if pm_price >= 0.70:
-            logger.info(f"  ⏭️ 秒开跳过: {direction.upper()} 价格已高 ({pm_price:.2f})")
+        # v0.3: 价格超过买入上限则放弃（赔率不够）
+        from src.config.settings import MAX_BUY_PRICE
+        if pm_price >= MAX_BUY_PRICE:
+            logger.info(f"  ⏭️ 秒开跳过: {direction.upper()} 价格太高 ({pm_price:.2f} > {MAX_BUY_PRICE})")
             return
 
         # === 流动性检查（挂限价单，只需确认 orderbook 存在）===
@@ -319,14 +339,18 @@ class TradingLoop:
         except Exception as e:
             logger.warning(f"  ⚠️ 流动性检查跳过: {e}")
 
-        edge = abs(change) * 5 + (0.50 - pm_price) * 0.5
-        edge = max(edge, 0)
-        edge = min(edge, 0.30)
+        # v0.7: 动态 Edge 门槛 — 基于近期波动率自适应
+        min_edge = self._calc_dynamic_edge()
 
-        logger.info(f"  📐 edge={edge:.3f} (change={change:+.3%}, pm={pm_price:.2f})")
+        # Edge = 差值百分比放大（更敏感）
+        # 0.15% 差值 → edge=0.03, 0.1% 差值 → edge=0.02
+        edge = abs(change) * 20
+        edge = min(edge, 0.50)
 
-        if edge < MIN_EDGE:
-            logger.info(f"  ⏭️ 秒开跳过: Edge 不足 ({edge:.3f} < {MIN_EDGE})")
+        logger.info(f"  📐 edge={edge:.3f} (change={change:+.3%}, pm={pm_price:.2f}, threshold={min_edge:.3f})")
+
+        if edge < min_edge:
+            logger.info(f"  ⏭️ 秒开跳过: Edge 不足 ({edge:.3f} < {min_edge:.3f})")
             return
 
         # 记录信号
@@ -340,12 +364,38 @@ class TradingLoop:
             filtered=0,
         )
 
-        # 固定投入（$2/次，保守）
-        cost_usd = min(2.0, self.risk_mgr.bankroll * 0.2)
+        # Polymarket 最小下单量 5 股，确保 cost >= price * 5
+        min_cost = pm_price * 5.1  # 留点余量
+        cost_usd = max(min_cost, min(2.0, self.risk_mgr.bankroll * 0.2))
+        cost_usd = round(cost_usd, 2)
         shares = cost_usd / pm_price
 
+        # === 二次价格确认：下单前重新获取 BTC 价格，防止反转 ===
+        btc_confirm = self.price_manager.ws.current_price if self.price_manager.ws else 0
+        if btc_confirm > 0 and btc > 0:
+            change_confirm = (btc_confirm - self.current_ptb) / self.current_ptb
+            direction_confirm = "up" if change_confirm > 0 else "down"
+            if direction != direction_confirm:
+                logger.info(
+                    f"  ⏭️ 秒开跳过: 方向反转! 初始{direction.upper()}(${btc:,.2f}) "
+                    f"→ 当前{direction_confirm.upper()}(${btc_confirm:,.2f}) PTB=${self.current_ptb:,.2f}"
+                )
+                return
+            # 如果差值缩小超过 50%，也放弃
+            if abs(change_confirm) < abs(change) * 0.5:
+                logger.info(
+                    f"  ⏭️ 秒开跳过: 差值大幅缩小 {change:+.3%} → {change_confirm:+.3%}"
+                )
+                return
+
+        # v0.6: 全部用 Taker 直接吃单，$52 本金挂 Maker 基本不成交
+        is_maker = False
+        actual_price = pm_price
+        cost_usd = round(actual_price * shares, 2)
+
         logger.info(
-            f"  ⚡ 秒开! {direction.upper()} BTC=${btc:,.2f} PTB=${self.current_ptb:,.2f} "
+            f"  ⚡ 🔴 Taker 秒开! "
+            f"{direction.upper()} BTC=${btc:,.2f} PTB=${self.current_ptb:,.2f} "
             f"差={change:+.2%} @ ${pm_price:.2f} 投入=${cost_usd:.2f}"
         )
 
@@ -354,9 +404,10 @@ class TradingLoop:
             side=direction,
             token_id=token,
             shares=shares,
-            price=pm_price,
+            price=actual_price,
             cost_usd=cost_usd,
             edge=edge,
+            maker_mode=is_maker,
         )
 
         # 记录持仓（用于止盈卖出）
@@ -376,8 +427,34 @@ class TradingLoop:
 
         self._traded_slugs.add(self.current_slug)
 
+    def _calc_dynamic_edge(self) -> float:
+        """v0.7: 基于近期波动率动态调整 edge 门槛
+        波动大 → 门槛低（更容易开仓）
+        波动小 → 门槛高（过滤噪音）
+        """
+        import numpy as np
+        klines = self.price_manager._kline_cache.get("15m", [])
+        if len(klines) < VOLATILITY_LOOKBACK:
+            return MIN_EDGE_BASE  # 数据不够用默认值
+
+        recent = klines[-VOLATILITY_LOOKBACK:]
+        # 每根K线的振幅 (high-low)/close
+        ranges = [(k["high"] - k["low"]) / k["close"] for k in recent]
+        volatility = np.mean(ranges)  # 平均振幅
+
+        # 基准: BTC 15m 平均振幅 ~0.15%
+        # 波动 > 基准 → 降低门槛，波动 < 基准 → 提高门槛
+        baseline_vol = 0.0015  # 0.15%
+        vol_ratio = volatility / baseline_vol
+
+        # 反比例调整：vol_ratio=2 (高波动) → edge 降低, vol_ratio=0.5 (低波动) → edge 升高
+        dynamic_edge = MIN_EDGE_BASE / vol_ratio
+        dynamic_edge = max(MIN_EDGE_MIN, min(MIN_EDGE_MAX, dynamic_edge))
+
+        return dynamic_edge
+
     async def _check_take_profit(self, btc: float):
-        """止盈检查：持仓价格上涨就卖出锁定利润"""
+        """v0.4 止盈检查：持仓价格上涨就卖出锁定利润"""
         pos = self._open_position
         if not pos:
             return
@@ -390,19 +467,16 @@ class TradingLoop:
 
         buy_price = pos["buy_price"]
 
-        # 止盈条件：价格涨了 30%+（比如 0.50 → 0.65+）
-        # 或者价格涨了 0.15+（比如 0.50 → 0.65）
-        profit_pct = (current_pm - buy_price) / buy_price if buy_price > 0 else 0
+        if buy_price <= 0:
+            return
 
-        # 条件1：盈利超过 30%
-        take_profit = profit_pct >= 0.30
-        # 条件2：价格绝对值超过 0.75（已经很确定赢了）
-        take_profit = take_profit or current_pm >= 0.75
-        # 条件3：盈利超过 20% 且剩余时间 < 3 分钟（快结算了，锁定利润）
-        remaining_check = False
-        elapsed_check = False
-        # 用简单方式判断
-        take_profit = take_profit or (profit_pct >= 0.20 and current_pm >= 0.65)
+        # v0.4: 用 settings 参数
+        profit_pct = (current_pm - buy_price) / buy_price
+
+        # 条件1：盈利超过 TAKE_PROFIT_PCT
+        take_profit = profit_pct >= TAKE_PROFIT_PCT
+        # 条件2：价格绝对值超过 TAKE_PROFIT_PRICE
+        take_profit = take_profit or current_pm >= TAKE_PROFIT_PRICE
 
         if not take_profit:
             return
@@ -424,8 +498,31 @@ class TradingLoop:
                 f"买=${buy_price:.2f} → 卖=${current_pm:.2f} "
                 f"利润=${profit:.2f} ({profit_pct:+.0%})"
             )
-            # 清除持仓
+            # 清除持仓 + 标记已交易
             self._open_position = None
+            self._traded_slugs.add(self.current_slug)
+
+    async def _place_passive_mm(self):
+        """v0.4: 被动做市 — 无信号时挂双面单赚 Liquidity Rewards + Spread"""
+        if not self.current_market:
+            return
+        
+        # 同一个市场只挂一次
+        if self._mm_market_slug == self.current_slug:
+            return
+        
+        results = place_passive_orders(
+            market_slug=self.current_slug,
+            up_token_id=self.current_market.up_token_id,
+            down_token_id=self.current_market.down_token_id,
+            up_price=self.current_market.up_price,
+            down_price=self.current_market.down_price,
+            spread=PASSIVE_MM_SPREAD,
+            size_usd=PASSIVE_MM_SIZE_USD,
+        )
+        
+        self._mm_orders = results
+        self._mm_market_slug = self.current_slug
 
     async def _last_minute_snipe(self):
         """最后 60 秒狙击"""
@@ -460,6 +557,12 @@ class TradingLoop:
 
     async def _on_market_settle(self):
         """市场结算"""
+        # v0.4: 撤掉当前市场的被动做市单
+        if self._mm_orders:
+            for order in self._mm_orders:
+                cancel_all_orders(order.get("token_id"))
+            self._mm_orders = []
+
         if not self.current_market or not self.current_ptb:
             self.current_slug = None
             self.current_market = None
@@ -482,22 +585,35 @@ class TradingLoop:
         conn = get_connection()
         conn.execute("UPDATE markets SET result=?, settled_at=datetime('now') WHERE slug=?", (result, self.current_slug))
         conn.commit()
-        conn.close()
 
         # 结算交易
         settle_trades(self.current_slug, result)
 
+        # v0.3: 连亏检测 — 连亏 N 次触发暂停
+        from src.config.settings import CONSECUTIVE_LOSS_PAUSE, COOLDOWN_AFTER_LOSS
+        recent = conn.execute(
+            "SELECT pnl FROM trades WHERE status='settled' ORDER BY settled_at DESC LIMIT ?",
+            (CONSECUTIVE_LOSS_PAUSE,)
+        ).fetchall()
+        conn.commit()
+        recent_losses = [r["pnl"] for r in recent if r["pnl"] is not None]
+        if len(recent_losses) >= CONSECUTIVE_LOSS_PAUSE and all(p < 0 for p in recent_losses[-CONSECUTIVE_LOSS_PAUSE:]):
+            import time as _t
+            self._pause_until = _t.time() + COOLDOWN_AFTER_LOSS * 60
+            logger.warning(
+                f"  🛑 连亏{CONSECUTIVE_LOSS_PAUSE}次! 暂停{COOLDOWN_AFTER_LOSS}分钟 "
+                f"(恢复时间: {_t.strftime('%H:%M:%S', _t.localtime(self._pause_until))})"
+            )
+
         # 记录 PnL 汇总
         summary = get_summary()
-        from src.utils.db import get_connection as gc
-        conn2 = gc()
-        conn2.execute(
+        conn.execute(
             "INSERT INTO pnl_log (total_pnl, bankroll, trade_count, win_count, loss_count) VALUES (?, ?, ?, ?, ?)",
             (summary["total_pnl"], self.risk_mgr.bankroll + summary["total_pnl"],
              summary["total_trades"], summary["wins"], summary["losses"])
         )
-        conn2.commit()
-        conn2.close()
+        conn.commit()
+        conn.close()
 
         logger.info(
             f"  📊 累计: {summary['total_trades']}笔交易 | "

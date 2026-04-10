@@ -1,7 +1,7 @@
 """
-Polymarket Gamma API — BTC 15 分钟市场发现
+Polymarket Gamma API — BTC 5 分钟市场发现
 
-市场 slug 格式: btc-updown-15m-{unix_timestamp}
+市场 slug 格式: btc-updown-5m-{unix_timestamp}
 """
 
 import asyncio
@@ -19,7 +19,7 @@ logger = setup_logger("gamma_client")
 
 @dataclass
 class BTC15mMarket:
-    """BTC 15 分钟市场"""
+    """BTC 5 分钟市场"""
     slug: str
     question: str
     market_id: str
@@ -42,33 +42,33 @@ def calc_current_market_slug() -> tuple[str, int, int]:
         (slug, start_timestamp, end_timestamp)
     """
     now = datetime.now(timezone.utc)
-    # 向下取整到 15 分钟
-    minute_offset = (now.minute // 15) * 15
+    # 向下取整到 5 分钟
+    minute_offset = (now.minute // 5) * 5
     start = now.replace(minute=minute_offset, second=0, microsecond=0)
     start_ts = int(start.timestamp())
-    end_ts = start_ts + 900  # 15 分钟 = 900 秒
-    slug = f"btc-updown-15m-{start_ts}"
+    end_ts = start_ts + 300  # 5 分钟 = 300 秒
+    slug = f"btc-updown-5m-{start_ts}"
     return slug, start_ts, end_ts
 
 
 def calc_next_market_slug() -> tuple[str, int, int]:
     """下一个市场"""
     _, start_ts, _ = calc_current_market_slug()
-    next_ts = start_ts + 900
-    next_end = next_ts + 900
-    slug = f"btc-updown-15m-{next_ts}"
+    next_ts = start_ts + 300
+    next_end = next_ts + 300
+    slug = f"btc-updown-5m-{next_ts}"
     return slug, next_ts, next_end
 
 
 async def discover_btc_markets(limit: int = 10) -> list[BTC15mMarket]:
     """
-    发现 BTC 15 分钟市场
+    发现 BTC 5 分钟市场
 
-    通过 Gamma API 的 /markets 端点搜索 btc-updown-15m
+    通过 Gamma API 的 /markets 端点搜索 btc-updown-5m
     """
     url = f"{GAMMA_API_URL}/markets"
     params = {
-        "slug_contains": "btc-updown-15m",
+        "slug_contains": "btc-updown-5m",
         "limit": limit,
         "active": "true",
         "order": "startDate",
@@ -93,14 +93,14 @@ async def discover_btc_markets(limit: int = 10) -> list[BTC15mMarket]:
     for m in markets_data:
         try:
             slug = m.get("slug", "")
-            if "btc-updown-15m" not in slug:
+            if "btc-updown-5m" not in slug:
                 continue
 
             # 解析时间戳
             parts = slug.split("-")
             ts = int(parts[-1])
             start_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-            end_time = datetime.fromtimestamp(ts + 900, tz=timezone.utc)
+            end_time = datetime.fromtimestamp(ts + 300, tz=timezone.utc)
 
             # 解析 token
             tokens = m.get("tokens", [])
@@ -144,7 +144,7 @@ async def discover_btc_markets(limit: int = 10) -> list[BTC15mMarket]:
             logger.debug(f"解析市场跳过: {e}")
             continue
 
-    logger.info(f"发现 {len(markets)} 个 BTC 15m 市场")
+    logger.info(f"发现 {len(markets)} 个 BTC 5m 市场")
     return markets
 
 
@@ -213,7 +213,7 @@ async def get_market_by_slug(slug: str) -> BTC15mMarket | None:
                     up_price=up_price,
                     down_price=down_price,
                     start_time=datetime.fromtimestamp(ts, tz=timezone.utc),
-                    end_time=datetime.fromtimestamp(ts + 900, tz=timezone.utc),
+                    end_time=datetime.fromtimestamp(ts + 300, tz=timezone.utc),
                     start_timestamp=ts,
                 )
 

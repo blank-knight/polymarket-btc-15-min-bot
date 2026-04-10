@@ -9,7 +9,7 @@
 
 from dataclasses import dataclass
 
-from src.config.settings import SNIPER_TRIGGER_SECONDS, SNIPER_MIN_MOVE_PCT, SNIPER_PRICE_LAG_PCT, MIN_EDGE
+from src.config.settings import SNIPER_TRIGGER_SECONDS, SNIPER_MIN_MOVE_PCT, SNIPER_PRICE_LAG_PCT, MIN_EDGE_BASE
 from src.decision.kelly_sizer import calculate_position
 from src.execution.trader import execute_trade
 from src.risk.risk_manager import RiskManager
@@ -88,7 +88,7 @@ async def evaluate_snipe(
         edge = (0.60 + abs(change) * 5) - down_price
         edge = min(edge, 0.30)
 
-    if edge < MIN_EDGE:
+    if edge < MIN_EDGE_BASE:
         return SnipeResult(
             direction=direction,
             edge=edge,
