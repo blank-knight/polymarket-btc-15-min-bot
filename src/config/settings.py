@@ -89,6 +89,22 @@ COOLDOWN_MINUTES = 60               # 暂停 60 分钟
 # === 数据库 ===
 DB_PATH = str(DATA_DIR / "btc_15m_bot.db")
 
+# === v0.8: 聪明钱包跟单 ===
+SMART_WALLET_ENABLED = False  # 总开关，配好钱包地址后开启
+SMART_WALLET_POLL_INTERVAL = 30     # 轮询间隔（秒）
+SMART_WALLET_MIN_CONFIDENCE = 0.6    # 最低跟单信心分数
+SMART_WALLET_BOOST_KELLY = 1.5       # 跟单信号叠加时 Kelly 放大系数
+SMART_WALLET_MAX_COPY_USD = 3.0      # 单笔跟单最大金额
+SMART_WALLET_FOLLOW_ONLY_BTC = True  # 只跟 BTC Up/Down 市场
+SMART_WALLET_FOLLOW_ONLY_BUY = True  # 只跟 BUY（开仓方向）
+
+# 聪明钱包列表（在这里配置要跟踪的钱包）
+SMART_WALLET_LIST = [
+    # 示例：
+    # {"address": "0x...", "name": "nebuladrive", "weight": 1.0, "min_win_rate": 0.6},
+    # {"address": "0x...", "name": "trader2", "weight": 0.8},
+]
+
 # === 日志 ===
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = str(DATA_DIR / "bot.log")

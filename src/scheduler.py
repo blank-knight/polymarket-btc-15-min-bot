@@ -34,9 +34,16 @@ from src.execution.trader import execute_trade, settle_trades, get_summary, plac
 from src.price.price_recorder import PriceRecorder
 from src.signal.last_minute_sniper import evaluate_snipe
 from src.signal.strategy_optimizer import StrategyOptimizer
-from src.config.settings import INITIAL_BANKROLL, MIN_EDGE_BASE, MIN_EDGE_MIN, MIN_EDGE_MAX, VOLATILITY_LOOKBACK, STRONG_EDGE_THRESHOLD, MAKER_PRICE_OFFSET, PASSIVE_MM_ENABLED, PASSIVE_MM_SPREAD, PASSIVE_MM_SIZE_USD, TAKE_PROFIT_PRICE, TAKE_PROFIT_PCT
+from src.config.settings import (
+    INITIAL_BANKROLL, MIN_EDGE_BASE, MIN_EDGE_MIN, MIN_EDGE_MAX, VOLATILITY_LOOKBACK,
+    STRONG_EDGE_THRESHOLD, MAKER_PRICE_OFFSET, PASSIVE_MM_ENABLED, PASSIVE_MM_SPREAD,
+    PASSIVE_MM_SIZE_USD, TAKE_PROFIT_PRICE, TAKE_PROFIT_PCT,
+    SMART_WALLET_ENABLED, SMART_WALLET_LIST, SMART_WALLET_POLL_INTERVAL,
+    SMART_WALLET_MIN_CONFIDENCE, SMART_WALLET_BOOST_KELLY, SMART_WALLET_MAX_COPY_USD,
+)
 from src.utils.db import insert_market, get_market
 from src.utils.logger import setup_logger
+from src.signal.smart_wallet_tracker import create_tracker, get_tracker
 
 logger = setup_logger("scheduler")
 
@@ -69,6 +76,11 @@ class TradingLoop:
         # v0.4: 被动做市状态
         self._mm_orders = []  # 当前被动做市挂单 [{"token_id", "order_id", ...}]
         self._mm_market_slug = None  # 当前做市的市场 slug
+        
+        # v0.8: 聪明钱包跟踪器
+        self._smart_wallet_tracker = None
+        self._last_wallet_poll = 0  # 上次轮询时间
+        self._cached_wallet_signals = []  # 缓存的跟单信号
 
     async def start(self):
         """启动交易循环"""
@@ -93,6 +105,18 @@ class TradingLoop:
 
         # 策略优化器
         self.optimizer.update_from_history()
+
+        # v0.8: 初始化聪明钱包跟踪器
+        if SMART_WALLET_ENABLED and SMART_WALLET_LIST:
+            try:
+                tracker = create_tracker(SMART_WALLET_LIST)
+                await tracker.initialize()
+                self._smart_wallet_tracker = tracker
+                logger.info(f"🧠 跟踪 {len(SMART_WALLET_LIST)} 个聪明钱包")
+            except Exception as e:
+                logger.warning(f"聪明钱包跟踪器初始化失败: {e}")
+        else:
+            logger.info("🧠 聪明钱包跟单未启用 (SMART_WALLET_ENABLED=False 或无钱包配置)")
 
         self.running = True
 
@@ -127,12 +151,20 @@ class TradingLoop:
                 elapsed = (now - start_time).total_seconds()
                 remaining = (end_time - now).total_seconds()
 
+                # v0.8: 聪明钱包轮询
+                if self._smart_wallet_tracker:
+                    await self._poll_smart_wallets()
+
                 # 🆕 全程策略监控：趋势共振 + 动量 + 定价偏差 + PTB差值
                 # 不限制时间窗口，只要信号够强就下单
                 if self.current_slug not in self._traded_slugs:
-                    await self._instant_open_trade()   # PTB 差值快速检查
+                    # v0.8: 先检查聪明钱包信号（可独立触发交易）
+                    if self._cached_wallet_signals:
+                        await self._execute_copy_trade()
                     if self.current_slug not in self._traded_slugs:
-                        await self._evaluate_strategy()  # 三层信号引擎
+                        await self._instant_open_trade()   # PTB 差值快速检查
+                        if self.current_slug not in self._traded_slugs:
+                            await self._evaluate_strategy()  # 三层信号引擎
 
                 # v0.4: 被动做市 — 无信号交易时挂双面单赚 Liquidity Rewards
                 if PASSIVE_MM_ENABLED and not self._mm_orders and self.current_market:
@@ -426,6 +458,126 @@ class TradingLoop:
             )
 
         self._traded_slugs.add(self.current_slug)
+
+    async def _poll_smart_wallets(self):
+        """v0.8: 轮询聪明钱包，检查新交易"""
+        import time as _t
+        now = _t.time()
+        if now - self._last_wallet_poll < SMART_WALLET_POLL_INTERVAL:
+            return
+        self._last_wallet_poll = now
+
+        try:
+            tracker = get_tracker()
+            if not tracker:
+                return
+            signals = await tracker.check_for_new_trades()
+            # 过滤低信心信号
+            signals = [s for s in signals if s["confidence"] >= SMART_WALLET_MIN_CONFIDENCE]
+            self._cached_wallet_signals = signals
+            if signals:
+                for s in signals:
+                    logger.info(
+                        f"  🧠 跟单信号: {s['wallet_name']} → {s['direction']} "
+                        f"信心={s['confidence']:.2f} 胜率={s['win_rate']:.1%}"
+                    )
+        except Exception as e:
+            logger.error(f"聪明钱包轮询失败: {e}")
+
+    async def _execute_copy_trade(self):
+        """v0.8: 执行跟单交易（聪明钱包信号触发）"""
+        if not self._cached_wallet_signals or not self.current_market:
+            return
+        if self.current_slug in self._traded_slugs:
+            return
+
+        import time as _t
+        if _t.time() < self._pause_until:
+            return
+
+        # 统计方向投票
+        up_votes = sum(1 for s in self._cached_wallet_signals if s["direction"] == "UP")
+        down_votes = sum(1 for s in self._cached_wallet_signals if s["direction"] == "DOWN")
+
+        if up_votes == down_votes:
+            logger.info("  ⏭️ 跟单跳过: 聪明钱包方向分歧")
+            self._cached_wallet_signals = []
+            return
+
+        direction = "up" if up_votes > down_votes else "down"
+        matching = [s for s in self._cached_wallet_signals if s["direction"] == direction.upper()]
+        avg_confidence = sum(s["confidence"] for s in matching) / len(matching)
+        max_weight = max(s["weight"] for s in matching)
+
+        # 信号叠加：如果我们的 edge 也同方向，加大仓位
+        btc = self.price_manager.ws.current_price if self.price_manager.ws else 0
+        our_direction = None
+        our_edge = 0
+        if btc > 0 and self.current_ptb:
+            change = (btc - self.current_ptb) / self.current_ptb
+            our_direction = "up" if change > 0 else "down"
+            our_edge = abs(change) * 20
+
+        same_direction = our_direction == direction and our_edge > 0.01
+
+        if direction == "up":
+            pm_price = self.current_market.up_price
+            token = self.current_market.up_token_id
+        else:
+            pm_price = self.current_market.down_price
+            token = self.current_market.down_token_id
+
+        from src.config.settings import MAX_BUY_PRICE
+        if pm_price >= MAX_BUY_PRICE:
+            logger.info(f"  ⏭️ 跟单跳过: {direction.upper()} 价格太高 ({pm_price:.2f})")
+            self._cached_wallet_signals = []
+            return
+
+        # 仓位计算
+        base_usd = min(SMART_WALLET_MAX_COPY_USD, self.risk_mgr.bankroll * 0.15)
+        if same_direction:
+            base_usd *= SMART_WALLET_BOOST_KELLY  # 信号叠加放大
+            logger.info(f"  🚀 信号叠加! 我们的 edge={our_edge:.3f} 同方向，仓位放大 {SMART_WALLET_BOOST_KELLY}x")
+
+        min_shares = 5.1
+        cost_usd = max(pm_price * min_shares, base_usd)
+        cost_usd = round(cost_usd, 2)
+        shares = cost_usd / pm_price
+
+        # Edge 估算：基于跟单信心
+        edge = avg_confidence * 0.5  # 简化
+
+        source = "combined" if same_direction else "copy"
+        logger.info(
+            f"  🧠 跟单执行! {direction.upper()} "
+            f"来源={source} 信心={avg_confidence:.2f} "
+            f"投票={up_votes}UP/{down_votes}DOWN "
+            f"@ ${pm_price:.2f} 投入=${cost_usd:.2f}"
+        )
+
+        result = execute_trade(
+            market_slug=self.current_slug,
+            side=direction,
+            token_id=token,
+            shares=shares,
+            price=pm_price,
+            cost_usd=cost_usd,
+            edge=edge,
+            maker_mode=False,
+        )
+
+        if result.get("status") in ("live", "simulated"):
+            self._open_position = {
+                "side": direction,
+                "token_id": token,
+                "shares": result.get("shares", shares),
+                "buy_price": result.get("price", pm_price),
+                "cost_usd": result.get("cost", cost_usd),
+                "market_slug": self.current_slug,
+            }
+
+        self._traded_slugs.add(self.current_slug)
+        self._cached_wallet_signals = []  # 清空缓存
 
     def _calc_dynamic_edge(self) -> float:
         """v0.7: 基于近期波动率动态调整 edge 门槛
