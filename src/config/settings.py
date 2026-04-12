@@ -3,6 +3,10 @@
 import os
 from pathlib import Path
 
+# 自动加载 .env
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
 # === 路径 ===
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -90,7 +94,7 @@ COOLDOWN_MINUTES = 60               # 暂停 60 分钟
 DB_PATH = str(DATA_DIR / "btc_15m_bot.db")
 
 # === v0.8: 聪明钱包跟单 ===
-SMART_WALLET_ENABLED = False  # 总开关，配好钱包地址后开启
+SMART_WALLET_ENABLED = True  # 总开关
 SMART_WALLET_POLL_INTERVAL = 30     # 轮询间隔（秒）
 SMART_WALLET_MIN_CONFIDENCE = 0.6    # 最低跟单信心分数
 SMART_WALLET_BOOST_KELLY = 1.5       # 跟单信号叠加时 Kelly 放大系数
@@ -100,9 +104,7 @@ SMART_WALLET_FOLLOW_ONLY_BUY = True  # 只跟 BUY（开仓方向）
 
 # 聪明钱包列表（在这里配置要跟踪的钱包）
 SMART_WALLET_LIST = [
-    # 示例：
-    # {"address": "0x...", "name": "nebuladrive", "weight": 1.0, "min_win_rate": 0.6},
-    # {"address": "0x...", "name": "trader2", "weight": 0.8},
+    {"address": "0x08ea825d0f6189ce27c3d1168511e30072fd9984", "name": "NebulaDrive", "weight": 1.0},
 ]
 
 # === 日志 ===
