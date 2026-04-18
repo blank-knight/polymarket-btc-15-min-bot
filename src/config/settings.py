@@ -45,6 +45,7 @@ MIN_EDGE_BASE = 0.025             # v0.7: 动态 edge 基准值 2.5%
 MIN_EDGE_MIN = 0.015             # 波动大时最低 1.5%
 MIN_EDGE_MAX = 0.045             # 波动小时最高 4.5%
 VOLATILITY_LOOKBACK = 20         # 用最近 20 根 5m K线算波动率
+VOLATILITY_PAUSE_THRESHOLD = 3.0    # 波动率超过基准3倍时暂停交易（防止极端行情）
 MIN_TRADE_USD = 1.0             # 最小交易金额
 MAX_BUY_PRICE = 0.60            # v0.3: 最大买入价 0.60（放宽，允许中等赔率下单）
 SETTLE_FEE_RATE = 0.04          # v0.3: Polymarket 结算手续费估算 4%

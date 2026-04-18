@@ -86,6 +86,8 @@ def execute_trade(
             price=price,
             cost_usd=cost_usd,
         )
+        if trade_id == -1:
+            return {"status": "duplicate", "trade_id": -1, "side": side}
         logger.info(
             f"📝 模拟交易 #{trade_id}: {mode_label} {side.upper()} {shares:.1f}股 "
             f"@ ${price:.3f} = ${cost_usd:.2f} (Edge={edge:+.1%})"
@@ -143,6 +145,8 @@ def execute_trade(
                 cost_usd=round(size * price, 2),
                 order_id=order_id,
             )
+            if trade_id == -1:
+                return {"status": "duplicate", "trade_id": -1, "side": side}
 
             logger.info(
                 f"💰 {mode_label} 实盘交易 #{trade_id}: {side.upper()} {size:.1f}股 "
@@ -172,6 +176,8 @@ def execute_trade(
                 price=price,
                 cost_usd=cost_usd,
             )
+            if trade_id == -1:
+                return {"status": "duplicate", "trade_id": -1, "side": side}
             return {
                 "status": "failed",
                 "trade_id": trade_id,

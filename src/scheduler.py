@@ -18,6 +18,7 @@
 """
 
 import asyncio
+import time as _t
 from datetime import datetime, timezone, timedelta
 
 from src.price.price_manager import PriceManager
@@ -72,6 +73,7 @@ class TradingLoop:
         # 持仓跟踪（止盈卖出用）
         self._open_position = None  # {"side": "up", "token_id": "...", "shares": 4.0, "buy_price": 0.50, "cost_usd": 2.0}
         self._pause_until = 0  # v0.3: 连亏暂停时间戳
+        self._session_start_time = 0  # 记录启动时间，用于限制连亏检测只看本次session
         
         # v0.4: 被动做市状态
         self._mm_orders = []  # 当前被动做市挂单 [{"token_id", "order_id", ...}]
@@ -84,9 +86,13 @@ class TradingLoop:
 
     async def start(self):
         """启动交易循环"""
-        logger.info("=" * 60)
+        logger.info("============================================================")
         logger.info("BTC 15M Bot 启动")
-        logger.info("=" * 60)
+        logger.info("============================================================")
+
+        # 记录session启动时间，连亏检测只看此时间之后的交易
+        self._session_start_time = _t.time()
+        logger.info(f"📅 Session起始时间: {_t.strftime('%Y-%m-%d %H:%M:%S', _t.localtime(self._session_start_time))}")
 
         # 启动价格管理器
         pm_ok = await self.price_manager.start()
@@ -101,7 +107,7 @@ class TradingLoop:
         # 启动 Price to Beat 获取器
         pb_ok = await self.price_beat.start()
         if not pb_ok:
-            logger.warning("Price to Beat 获取器不可用，将使用 K 线动量替代")
+            logger.warning("Price to Beat 获取器不可用！没有PTB就无法交易")
 
         # 策略优化器
         self.optimizer.update_from_history()
@@ -193,10 +199,6 @@ class TradingLoop:
                 logger.error(f"主循环异常: {e}")
                 await asyncio.sleep(10)
 
-            except Exception as e:
-                logger.error(f"主循环异常: {e}")
-                await asyncio.sleep(10)
-
     async def _on_new_market(self, slug: str, start_ts: int, end_ts: int):
         """新市场开始"""
         # v0.4: 先撤掉上一个市场的被动做市单
@@ -228,13 +230,15 @@ class TradingLoop:
             logger.warning(f"  市场未找到: {slug}")
             self.current_market = None
 
-        # 获取 Price to Beat
+        # 获取 Price to Beat — 这是市场的核心参数，必须从页面抓取
         ptb = await self.price_beat.fetch_price_to_beat(slug)
         if ptb:
             self.current_ptb = ptb
         else:
-            logger.warning("  Price to Beat 获取失败，使用 K 线动量替代")
+            logger.warning("  Price to Beat 获取失败！无PTB则无法交易，本市场跳过")
             self.current_ptb = None
+            self.current_market = None  # 同时清空市场，阻止所有交易路径
+            return
 
     async def _evaluate_strategy(self):
         """策略分析"""
@@ -243,6 +247,13 @@ class TradingLoop:
 
         # 检查当前市场是否已下过单（防止重复）
         if self.current_slug in self._traded_slugs:
+            return
+
+        # 波动率过滤
+        vol_paused, vol_ratio = self._check_volatility_pause()
+        if vol_paused:
+            if _t.time() % 300 < 10:
+                logger.info(f"  ⚠️ 波动率过高 ({vol_ratio:.1f}x)，策略评估暂停")
             return
 
         ind = self.price_manager.get_indicators()
@@ -308,6 +319,11 @@ class TradingLoop:
             edge=position.edge,
         )
 
+        if result.get("status") == "duplicate":
+            logger.warning(f"  ⛔ 重复下单被拦截: {self.current_slug}")
+            self._traded_slugs.add(self.current_slug)
+            return
+
         logger.info(
             f"  📈 {signal.strength.value} 信号: {signal.direction.upper()} "
             f"置信度={signal.confidence:.1%} Edge={signal.edge:+.1%}"
@@ -322,11 +338,17 @@ class TradingLoop:
             return
 
         # v0.3: 连亏暂停检查
-        import time as _t
         if _t.time() < self._pause_until:
             remaining = int((self._pause_until - _t.time()) / 60)
             if _t.time() % 300 < 10:  # 每5分钟打印一次
                 logger.info(f"  ⏸️ 连亏暂停中，还需等待 {remaining} 分钟")
+            return
+
+        # 波动率过滤：极端行情暂停
+        vol_paused, vol_ratio = self._check_volatility_pause()
+        if vol_paused:
+            if _t.time() % 300 < 10:
+                logger.info(f"  ⚠️ 波动率过高 ({vol_ratio:.1f}x)，暂停交易")
             return
 
         btc = self.price_manager.ws.current_price if self.price_manager.ws else 0
@@ -442,6 +464,11 @@ class TradingLoop:
             maker_mode=is_maker,
         )
 
+        if result.get("status") == "duplicate":
+            logger.warning(f"  ⛔ 重复下单被拦截: {self.current_slug}")
+            self._traded_slugs.add(self.current_slug)
+            return
+
         # 记录持仓（用于止盈卖出）
         if result.get("status") in ("live", "simulated"):
             self._open_position = {
@@ -461,7 +488,6 @@ class TradingLoop:
 
     async def _poll_smart_wallets(self):
         """v0.8: 轮询聪明钱包，检查新交易"""
-        import time as _t
         now = _t.time()
         if now - self._last_wallet_poll < SMART_WALLET_POLL_INTERVAL:
             return
@@ -491,7 +517,6 @@ class TradingLoop:
         if self.current_slug in self._traded_slugs:
             return
 
-        import time as _t
         if _t.time() < self._pause_until:
             return
 
@@ -566,6 +591,12 @@ class TradingLoop:
             maker_mode=False,
         )
 
+        if result.get("status") == "duplicate":
+            logger.warning(f"  ⛔ 重复下单被拦截: {self.current_slug}")
+            self._traded_slugs.add(self.current_slug)
+            self._cached_wallet_signals = []
+            return
+
         if result.get("status") in ("live", "simulated"):
             self._open_position = {
                 "side": direction,
@@ -578,6 +609,32 @@ class TradingLoop:
 
         self._traded_slugs.add(self.current_slug)
         self._cached_wallet_signals = []  # 清空缓存
+
+    def _check_volatility_pause(self) -> tuple[bool, float]:
+        """检查当前波动率是否过高，应该暂停交易
+        
+        Returns:
+            (should_pause, current_volatility_ratio)
+            volatility_ratio > 3.0 = 极端行情，暂停
+        """
+        try:
+            import numpy as np
+            klines = self.price_manager._kline_cache.get("15m", [])
+            if len(klines) < 10:
+                return False, 0.0
+            
+            # 最近10根K线的振幅
+            recent = klines[-10:]
+            ranges = [(k["high"] - k["low"]) / k["close"] for k in recent]
+            current_vol = np.mean(ranges)
+            
+            # 基准: BTC 15m 正常振幅约 0.15%
+            baseline_vol = 0.0015
+            vol_ratio = current_vol / baseline_vol
+            
+            return vol_ratio > 3.0, vol_ratio  # 波动超过基准3倍则暂停
+        except Exception:
+            return False, 0.0
 
     def _calc_dynamic_edge(self) -> float:
         """v0.7: 基于近期波动率动态调整 edge 门槛
@@ -709,6 +766,7 @@ class TradingLoop:
 
     async def _on_market_settle(self):
         """市场结算"""
+        import time as _t
         # v0.4: 撤掉当前市场的被动做市单
         if self._mm_orders:
             for order in self._mm_orders:
@@ -741,16 +799,15 @@ class TradingLoop:
         # 结算交易
         settle_trades(self.current_slug, result)
 
-        # v0.3: 连亏检测 — 连亏 N 次触发暂停
+        # v0.3: 连亏检测 — 连亏 N 次触发暂停（仅看当前session的交易）
         from src.config.settings import CONSECUTIVE_LOSS_PAUSE, COOLDOWN_AFTER_LOSS
         recent = conn.execute(
-            "SELECT pnl FROM trades WHERE status='settled' ORDER BY settled_at DESC LIMIT ?",
-            (CONSECUTIVE_LOSS_PAUSE,)
+            "SELECT pnl FROM trades WHERE status='settled' AND settled_at > ? ORDER BY settled_at DESC LIMIT ?",
+            (_t.strftime('%Y-%m-%d %H:%M:%S', _t.localtime(self._session_start_time)), CONSECUTIVE_LOSS_PAUSE,)
         ).fetchall()
         conn.commit()
         recent_losses = [r["pnl"] for r in recent if r["pnl"] is not None]
         if len(recent_losses) >= CONSECUTIVE_LOSS_PAUSE and all(p < 0 for p in recent_losses[-CONSECUTIVE_LOSS_PAUSE:]):
-            import time as _t
             self._pause_until = _t.time() + COOLDOWN_AFTER_LOSS * 60
             logger.warning(
                 f"  🛑 连亏{CONSECUTIVE_LOSS_PAUSE}次! 暂停{COOLDOWN_AFTER_LOSS}分钟 "

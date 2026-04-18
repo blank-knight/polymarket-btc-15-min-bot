@@ -137,6 +137,17 @@ def get_market(slug: str) -> dict | None:
 def insert_trade(market_slug: str, side: str, shares: float, price: float, cost_usd: float, **kwargs) -> int:
     conn = get_connection()
     c = conn.cursor()
+    
+    # DB-level dedup: reject if there's already an open trade for this market
+    existing = c.execute(
+        "SELECT id FROM trades WHERE market_slug=? AND status='open' LIMIT 1",
+        (market_slug,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        logger.warning(f"重复下单拦截: 市场 {market_slug} 已有 open 交易 #{existing[0]}")
+        return -1
+    
     cols = ["market_slug", "side", "shares", "price", "cost_usd"] + list(kwargs.keys())
     vals = [market_slug, side, shares, price, cost_usd] + list(kwargs.values())
     placeholders = ", ".join(["?"] * len(cols))

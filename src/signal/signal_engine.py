@@ -87,22 +87,21 @@ def generate_signal(
     # ========== Layer 1: 趋势方向 ==========
     signal.layer1_trend, signal.layer1_detail = _evaluate_trend(indicators)
 
-    # ========== Layer 2: 动量确认 ==========
+    # ========== Layer 2: PTB偏差确认 ==========
+    # PTB 是市场定义参数，只能从 Polymarket 页面抓取，不能用动量估算
+    # 没有 PTB = 不能判断方向，直接不交易
     if price_to_beat and price_to_beat > 0:
         signal.layer2_momentum, signal.layer2_detail = _evaluate_momentum(
             btc_current, price_to_beat, indicators
         )
     else:
-        # 没有 price to beat，用 15 分钟 K 线内动量
-        if indicators.momentum_15m > MOMENTUM_THRESHOLD:
-            signal.layer2_momentum = "up"
-            signal.layer2_detail = f"15m 内涨 {indicators.momentum_15m:+.2%}"
-        elif indicators.momentum_15m < -MOMENTUM_THRESHOLD:
-            signal.layer2_momentum = "down"
-            signal.layer2_detail = f"15m 内跌 {indicators.momentum_15m:+.2%}"
-        else:
-            signal.layer2_momentum = "neutral"
-            signal.layer2_detail = f"15m 内波动小 {indicators.momentum_15m:+.2%}"
+        # 没有 PTB，Layer 2 无法判断，信号不可交易
+        signal.layer2_momentum = "neutral"
+        signal.layer2_detail = "PTB未知，无法判断"
+        signal.direction = None
+        signal.should_trade = False
+        signal.safety_skip_reason = "PTB未获取，跳过"
+        return signal
 
     # ========== Layer 3: 定价偏差 ==========
     signal.layer3_deviation = _evaluate_pricing(up_price, down_price)
